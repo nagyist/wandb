@@ -375,7 +375,6 @@ message Settings {
   // Whether to sync TensorBoard logs to W&B.
   google.protobuf.BoolValue sync_tensorboard = 179;
 
-
   // Whether to skip saving the run events to the transaction log.
   //
   // This is only relevant for online runs. Can be used to reduce the
