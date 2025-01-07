@@ -189,6 +189,7 @@ class Settings(google.protobuf.message.Message):
     _OFFLINE_FIELD_NUMBER: builtins.int
     X_SYNC_FIELD_NUMBER: builtins.int
     SYNC_FILE_FIELD_NUMBER: builtins.int
+    X_SKIP_TRANSACTION_LOG_FIELD_NUMBER: builtins.int
     _SHARED_FIELD_NUMBER: builtins.int
     RUN_ID_FIELD_NUMBER: builtins.int
     RUN_URL_FIELD_NUMBER: builtins.int
@@ -263,7 +264,6 @@ class Settings(google.protobuf.message.Message):
     CONSOLE_FIELD_NUMBER: builtins.int
     CONSOLE_MULTIPART_FIELD_NUMBER: builtins.int
     SYNC_TENSORBOARD_FIELD_NUMBER: builtins.int
-    X_SKIP_TRANSACTION_LOG_FIELD_NUMBER: builtins.int
     _AWS_LAMBDA_FIELD_NUMBER: builtins.int
     X_CLI_ONLY_MODE_FIELD_NUMBER: builtins.int
     _COLAB_FIELD_NUMBER: builtins.int
@@ -382,6 +382,16 @@ class Settings(google.protobuf.message.Message):
     @property
     def sync_file(self) -> google.protobuf.wrappers_pb2.StringValue:
         """Path to the transaction log file."""
+    @property
+    def x_skip_transaction_log(self) -> google.protobuf.wrappers_pb2.BoolValue:
+        """Whether to skip saving the run events to the transaction log.
+
+        This is only relevant for online runs. Can be used to reduce the
+        amount of data written to disk.
+
+        Should be used with caution, as it removes the gurantees about
+        recoverability.
+        """
     @property
     def _shared(self) -> google.protobuf.wrappers_pb2.BoolValue:
         """Whether we are in shared mode.
@@ -712,16 +722,6 @@ class Settings(google.protobuf.message.Message):
     def sync_tensorboard(self) -> google.protobuf.wrappers_pb2.BoolValue:
         """Whether to sync TensorBoard logs to W&B."""
     @property
-    def x_skip_transaction_log(self) -> google.protobuf.wrappers_pb2.BoolValue:
-        """Whether to skip saving the run events to the transaction log.
-
-        This is only relevant for online runs. Can be used to reduce the
-        amount of data written to disk.
-
-        Should be used with caution, as it removes the gurantees about
-        recoverability.
-        """
-    @property
     def _aws_lambda(self) -> google.protobuf.wrappers_pb2.BoolValue: ...
     @property
     def x_cli_only_mode(self) -> google.protobuf.wrappers_pb2.BoolValue: ...
@@ -915,6 +915,7 @@ class Settings(google.protobuf.message.Message):
         _offline: google.protobuf.wrappers_pb2.BoolValue | None = ...,
         x_sync: google.protobuf.wrappers_pb2.BoolValue | None = ...,
         sync_file: google.protobuf.wrappers_pb2.StringValue | None = ...,
+        x_skip_transaction_log: google.protobuf.wrappers_pb2.BoolValue | None = ...,
         _shared: google.protobuf.wrappers_pb2.BoolValue | None = ...,
         run_id: google.protobuf.wrappers_pb2.StringValue | None = ...,
         run_url: google.protobuf.wrappers_pb2.StringValue | None = ...,
@@ -989,7 +990,6 @@ class Settings(google.protobuf.message.Message):
         console: google.protobuf.wrappers_pb2.StringValue | None = ...,
         console_multipart: google.protobuf.wrappers_pb2.BoolValue | None = ...,
         sync_tensorboard: google.protobuf.wrappers_pb2.BoolValue | None = ...,
-        x_skip_transaction_log: google.protobuf.wrappers_pb2.BoolValue | None = ...,
         _aws_lambda: google.protobuf.wrappers_pb2.BoolValue | None = ...,
         x_cli_only_mode: google.protobuf.wrappers_pb2.BoolValue | None = ...,
         _colab: google.protobuf.wrappers_pb2.BoolValue | None = ...,
