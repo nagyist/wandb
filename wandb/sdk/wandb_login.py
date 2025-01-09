@@ -44,7 +44,7 @@ def login(
     host: Optional[str] = None,
     force: Optional[bool] = None,
     timeout: Optional[int] = None,
-    verify: bool = False,
+    verify: bool = True,
 ) -> bool:
     """Set up W&B login credentials.
 
@@ -297,7 +297,7 @@ def _login(
     host: Optional[str] = None,
     force: Optional[bool] = None,
     timeout: Optional[int] = None,
-    verify: bool = False,
+    verify: bool = True,
     _backend=None,
     _silent: Optional[bool] = None,
     _disable_warning: Optional[bool] = None,
