@@ -5,7 +5,6 @@ from __future__ import annotations
 import atexit
 import concurrent.futures
 import contextlib
-from itertools import filterfalse
 import json
 import logging
 import multiprocessing.dummy
@@ -19,6 +18,7 @@ from copy import copy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import partial
+from itertools import filterfalse
 from pathlib import PurePosixPath
 from typing import IO, TYPE_CHECKING, Any, Iterator, Literal, Sequence, Type, final
 from urllib.parse import quote, urljoin, urlparse
