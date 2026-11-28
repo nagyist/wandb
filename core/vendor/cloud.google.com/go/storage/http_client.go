@@ -89,13 +89,14 @@ func newHTTPStorageClient(ctx context.Context, opts ...storageOption) (client st
 		)
 		// Don't error out here. The user may have passed in their own HTTP
 		// client which does not auth with ADC or other common conventions.
-		c, err := internaloption.AuthCreds(ctx, o)
-		if err == nil {
-			creds = c
-			o = append(o, option.WithAuthCredentials(creds))
-		} else if gc, err := transport.Creds(ctx, o...); err == nil {
-			googleCreds = gc
-			o = append(o, option.WithCredentials(googleCreds))
+		if res, rErr := internaloption.NewUnsafeResolver(o...); rErr == nil && !res.ResolvedWithAPIKeyIsCustom() {
+			if c, err := internaloption.AuthCreds(ctx, o); err == nil {
+				creds = c
+				o = append(o, option.WithAuthCredentials(creds))
+			} else if gc, err := transport.Creds(ctx, o...); err == nil {
+				googleCreds = gc
+				o = append(o, option.WithCredentials(googleCreds))
+			}
 		}
 	} else {
 		var hostURL *url.URL
@@ -125,14 +126,22 @@ func newHTTPStorageClient(ctx context.Context, opts ...storageOption) (client st
 
 	var clientMetrics *clientMetrics
 	var metricsCleanup func()
-	if isOtelMetricsEnabled(&config) {
+	if isOtelMetricsEnabled(&config) || isOtelDebugMetricsEnabled(&config) {
 		var project string
 		if creds != nil {
 			project, _ = creds.ProjectID(ctx)
 		} else if googleCreds != nil {
 			project = googleCreds.ProjectID
 		}
-		clientMetrics, metricsCleanup = initClientMetrics(ctx, project, &config)
+		monSourceOpts := s.clientOption
+		if len(s.monitoringSourceOption) > 0 {
+			monSourceOpts = s.monitoringSourceOption
+		}
+		mOpts, exportOK := monitoringClientOptions(monSourceOpts, creds, googleCreds)
+		if exportOK || config.meterProvider != nil || config.metricExporter != nil {
+			config.monitoringOpts = mOpts
+			clientMetrics, metricsCleanup = initClientMetrics(ctx, project, &config)
+		}
 	}
 	if metricsCleanup != nil {
 		defer func() {
@@ -142,9 +151,19 @@ func newHTTPStorageClient(ctx context.Context, opts ...storageOption) (client st
 		}()
 	}
 
-	if clientMetrics != nil && creds != nil {
-		creds = wrapAuthCredentials(creds, clientMetrics)
-		s.clientOption = append(s.clientOption, option.WithAuthCredentials(creds))
+	if creds != nil {
+		tracingEnabled := isOTelTracingDevEnabled()
+		// Wrap in place: htransport.NewClient in NewClient already holds this
+		// pointer, so its transport must observe the wrapped TokenProvider.
+		if clientMetrics != nil {
+			*creds = *wrapAuthCredentials(creds, clientMetrics)
+		}
+		if tracingEnabled {
+			*creds = *wrapAuthCredentialsForTracing(creds)
+		}
+		if clientMetrics != nil || tracingEnabled {
+			s.clientOption = append(s.clientOption, option.WithAuthCredentials(creds))
+		}
 	}
 
 	// htransport selects the correct endpoint among WithEndpoint (user override), WithDefaultEndpointTemplate, and WithDefaultMTLSEndpoint.
@@ -229,17 +248,37 @@ func (t *trackingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	if baseRT == nil {
 		baseRT = http.DefaultTransport
 	}
-	features := t.features | featureAttributes(req.Context())
-	// Merge all existing headers for this key.
-	features |= mergeFeatureAttributes(req.Header.Values(featureTrackerHeaderName))
-	if features > 0 {
-		// Clone the request to avoid modifying the original one.
-		clonedReq := req.Clone(req.Context())
-		clonedReq.Header.Set(featureTrackerHeaderName, encodeUint32(features))
-		return baseRT.RoundTrip(clonedReq)
-	}
+	// Start a Storage.UploadChunk span if req is a resumable upload chunk request.
+	ctx, isChunk := startHTTPUploadChunkSpan(req.Context(), req.Header)
 
-	return baseRT.RoundTrip(req)
+	features := t.features | featureAttributes(ctx)
+	// Merge all existing headers for this key.
+	existing := req.Header.Values(featureTrackerHeaderName)
+	features |= mergeFeatureAttributes(existing)
+	outReq := req
+	if features > 0 || len(existing) > 0 {
+		// This transport owns the feature header: it is always rewritten from the
+		// merged bitmask so that only a single, well-formed value is sent, and it
+		// is removed entirely when there is nothing to report (e.g. a value set on
+		// the context by a caller for an unrelated client must not be forwarded).
+		// Clone the request to avoid modifying the original one.
+		outReq = req.Clone(ctx)
+		if features > 0 {
+			outReq.Header.Set(featureTrackerHeaderName, encodeFeatureMask(features))
+		} else {
+			outReq.Header.Del(featureTrackerHeaderName)
+		}
+	} else if isChunk {
+		outReq = req.WithContext(ctx)
+	}
+	resp, err := baseRT.RoundTrip(outReq)
+	if isChunk {
+		finishSpan(ctx, httpUploadChunkError(resp, err))
+	} else if resp != nil {
+		recordUploadIDFromHeader(ctx, resp.Header)
+	}
+	recordHTTPWritePayload(req, resp)
+	return resp, err
 }
 
 func (t *trackingTransport) CloseIdleConnections() {
@@ -448,7 +487,8 @@ func (c *httpStorageClient) ListObjects(ctx context.Context, bucket string, q *Q
 		ctx, record := startMetricsOp(it.ctx, "ListObjects", true)
 		defer func() { record(err) }()
 		// Add trace span around List API call within the fetch.
-		ctx, _ = startSpan(ctx, "httpStorageClient.ObjectsListCall")
+		// Bucket.Objects has no operation span, so gcp.storage.uri is recorded on each per-page ObjectsListCall span.
+		ctx, _ = startSpan(ctx, "httpStorageClient.ObjectsListCall", withStorageURI(bucket, ""), rpcSystemHTTPOpt)
 		defer func() { endSpan(ctx, err) }()
 		req := c.raw.Objects.List(bucket)
 		if it.query.SoftDeleted {
@@ -895,6 +935,9 @@ func (c *httpStorageClient) ComposeObject(ctx context.Context, req *composeObjec
 	if req.predefinedACL != "" {
 		call.DestinationPredefinedAcl(req.predefinedACL)
 	}
+	if req.dstObject.attrs.KMSKeyName != "" {
+		call.KmsKeyName(req.dstObject.attrs.KMSKeyName)
+	}
 	if err := setEncryptionHeaders(call.Header(), req.dstObject.encryptionKey, false); err != nil {
 		return nil, err
 	}
@@ -971,7 +1014,7 @@ func (c *httpStorageClient) NewMultiRangeDownloader(ctx context.Context, params 
 }
 
 func (c *httpStorageClient) NewRangeReader(ctx context.Context, params *newRangeReaderParams, opts ...storageOption) (r *Reader, err error) {
-	ctx, _ = startSpan(ctx, "httpStorageClient.NewRangeReader")
+	ctx, _ = startSpan(ctx, "httpStorageClient.NewRangeReader", rpcSystemHTTPOpt)
 	defer func() { endSpan(ctx, err) }()
 
 	s := callSettings(c.settings, opts...)
@@ -1090,7 +1133,7 @@ func (hiw *httpInternalWriter) validateChecksumFromServer() error {
 	// Do not check for channel closure as error is already set on the writer
 	// if serverChecksumChan is closed without checksum
 	if ok && hiw.fullObjectChecksum != serverChecksum {
-		return fmt.Errorf("storage: object checksum mismatch: computed %q, server %q; the bucket may contain corrupted object", encodeUint32(hiw.fullObjectChecksum), encodeUint32(serverChecksum))
+		return fmt.Errorf("%w: computed %q, server %q; the bucket may contain corrupted object", errChecksumMismatch, encodeUint32(hiw.fullObjectChecksum), encodeUint32(serverChecksum))
 	}
 	return nil
 }
@@ -1163,10 +1206,12 @@ func (c *httpStorageClient) OpenWriter(params *openWriterParams, opts ...storage
 		if attrs.MD5 != nil {
 			rawObj.Md5Hash = base64.StdEncoding.EncodeToString(attrs.MD5)
 		}
+		// Attach the aligned chunk size so trackingTransport can record Storage.UploadChunk spans.
+		uploadCtx := withUploadChunkSize(params.ctx, params.chunkSize)
 		call := c.raw.Objects.Insert(params.bucket, rawObj).
 			Media(pr, mediaOpts...).
 			Projection("full").
-			Context(params.ctx).
+			Context(uploadCtx).
 			Name(params.attrs.Name)
 		call.ProgressUpdater(func(n, _ int64) { progress(n) })
 
@@ -1193,31 +1238,46 @@ func (c *httpStorageClient) OpenWriter(params *openWriterParams, opts ...storage
 
 			// The internals that perform call.Do automatically retry both the initial
 			// call to set up the upload as well as calls to upload individual chunks
-			// for a resumable upload (as long as the chunk size is non-zero). Hence
-			// there is no need to add retries here.
-
-			// Retry only when the operation is idempotent or the retry policy is RetryAlways.
-			var useRetry bool
-			if (s.retry == nil || s.retry.policy == RetryIdempotent) && s.idempotent {
-				useRetry = true
-			} else if s.retry != nil && s.retry.policy == RetryAlways {
-				useRetry = true
+			// for a resumable upload (as long as the chunk size is non-zero). WithRetry
+			// below replaces these defaults when retries are on or for RetryNever.
+			// Writers without preconditions under RetryIdempotent keep the defaults,
+			// so maxAttempts doesn't limit their chunk retries. Stall retries under
+			// ChunkTransferTimeout skip WithRetry, so maxAttempts and RetryNever
+			// don't apply to them.
+			retry := s.retry
+			if retry == nil {
+				retry = defaultRetry
 			}
-			if useRetry {
-				if s.retry != nil {
-					// Wrap shouldRetry to adapt to the googleapi WithRetry signature.
-					var retryFunc func(error) bool
-					if s.retry.shouldRetry != nil {
-						retryFunc = func(err error) bool {
-							return s.retry.shouldRetry(err, nil)
-						}
+			attempts := 1
+			var maxAttemptsReached bool
+			switch {
+			// Retry only when the operation is idempotent or the retry policy is RetryAlways.
+			case retry.policy == RetryAlways || (retry.policy == RetryIdempotent && s.idempotent):
+				call.WithRetry(retry.backoff, func(err error) bool {
+					if err == nil {
+						// Called after each successful request, so each request gets its own budget.
+						attempts = 1
+						maxAttemptsReached = false
+						return false
 					}
-					call.WithRetry(s.retry.backoff, retryFunc)
-				} else {
-					call.WithRetry(nil, nil)
-				}
+					if retry.maxAttempts != nil && attempts >= *retry.maxAttempts {
+						maxAttemptsReached = true
+						return false
+					}
+					if !retry.runShouldRetry(err, nil) {
+						return false
+					}
+					attempts++
+					return true
+				})
+			case retry.policy == RetryNever:
+				// Without WithRetry, the upload library retries resumable chunks by default.
+				call.WithRetry(nil, func(error) bool { return false })
 			}
 			resp, err = call.Do()
+			if err != nil && maxAttemptsReached {
+				err = fmt.Errorf("storage: retry failed after %d attempts; last error: %w", *retry.maxAttempts, err)
+			}
 		}
 		if err != nil {
 			errorf(err)
@@ -1508,7 +1568,7 @@ func (r *httpReader) Read(p []byte) (int, error) {
 			// anything worth looking at.
 			if r.checkCRC {
 				if r.gotCRC != r.wantCRC {
-					return n, fmt.Errorf("storage: bad CRC on read: got %d, want %d",
+					return n, fmt.Errorf("%w: bad CRC on read: got %d, want %d", errChecksumMismatch,
 						r.gotCRC, r.wantCRC)
 				}
 			}
@@ -1578,6 +1638,7 @@ func readerReopen(ctx context.Context, header http.Header, params *newRangeReade
 		var res *http.Response
 		err = run(ctx, func(ctx context.Context) error {
 			res, err = doDownload(ctx)
+			recordHTTPReadPayload(ctx, res, start, params.length)
 			if err != nil {
 				return formatObjectErr(err)
 			}
@@ -1610,8 +1671,9 @@ func readerReopen(ctx context.Context, header http.Header, params *newRangeReade
 			// With "Content-Encoding": "gzip" aka decompressive transcoding, GCS serves
 			// back the whole file regardless of the range count passed in as per:
 			//      https://cloud.google.com/storage/docs/transcoding#range,
-			// thus we have to manually move the body forward by seen bytes.
-			if decompressiveTranscoding(res) && seen > 0 {
+			// thus we have to manually move the body forward by seen bytes when a
+			// full-object (non-206) response is returned.
+			if decompressiveTranscoding(res) && seen > 0 && res.StatusCode != http.StatusPartialContent {
 				_, _ = io.CopyN(io.Discard, res.Body, seen)
 			}
 
