@@ -4,6 +4,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"slices"
+	"strings"
+
+	"github.com/charmbracelet/x/ansi"
 )
 
 // execMsg is used internally to run an ExecCommand sent with Exec.
@@ -100,6 +104,15 @@ func (c *osExecCommand) SetStderr(w io.Writer) {
 
 // exec runs an ExecCommand and delivers the results to the program as a Msg.
 func (p *Program) exec(c ExecCommand, fn ExecCallback) {
+	// Blank the current view before releasing the terminal so the renderer's
+	// final flush doesn't write the last View() output to stdout. Without
+	// this, the view content leaks to the terminal and persists after the
+	// subprocess exits. Terminal mode flags such as AltScreen are preserved so
+	// the screen mode is restored correctly when the program resumes. See #431.
+	if p.renderer != nil {
+		p.renderer.clearView()
+	}
+
 	if err := p.releaseTerminal(false); err != nil {
 		// If we can't release input, abort.
 		if fn != nil {
@@ -111,6 +124,14 @@ func (p *Program) exec(c ExecCommand, fn ExecCallback) {
 	c.SetStdin(p.input)
 	c.SetStdout(p.output)
 	c.SetStderr(os.Stderr)
+
+	// A program that resumes itself brings back what it started, so the
+	// child must not be resumed in its place.
+	if oc, ok := c.(*osExecCommand); ok && p.renderer != nil && p.renderer.reportsProgramResume() {
+		oc.Env = slices.DeleteFunc(oc.Environ(), func(kv string) bool {
+			return strings.HasPrefix(kv, ansi.ProgramResumeTokenEnv+"=")
+		})
+	}
 
 	// Execute system command.
 	if err := c.Run(); err != nil {

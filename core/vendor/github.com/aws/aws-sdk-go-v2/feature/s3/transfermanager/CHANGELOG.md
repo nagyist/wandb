@@ -1,3 +1,90 @@
+# v0.5.14 (2026-11-27)
+
+* **Dependency Update**: Update smithy-go to v1.28.11
+* **Dependency Update**: Updated to the latest SDK module versions
+
+# v0.5.13 (2026-11-25)
+
+* **Dependency Update**: Update to smithy-go v1.28.10.
+* **Dependency Update**: Updated to the latest SDK module versions
+
+# v0.5.12 (2026-11-24)
+
+* **Bug Fix**: Fix GetObject and DownloadObject failing or reporting an incorrect length when the requested byte range extends past the end of an S3 object.
+* **Bug Fix**: Preserve the abort error alongside the original upload error when an S3 multipart upload and its cleanup both fail.
+* **Bug Fix**: Quick exit GetObject body read for empty buffer so it does not cause deadlock
+* **Bug Fix**: Retry part body read failures in `GetObject` up to `PartBodyMaxRetries`, matching `DownloadObject`.
+
+# v0.5.11 (2026-11-19)
+
+* **Dependency Update**: Updated to the latest SDK module versions
+
+# v0.5.10 (2026-11-18)
+
+* **Dependency Update**: Updated to the latest SDK module versions
+
+# v0.5.9 (2026-11-17)
+
+* **Dependency Update**: Updated to the latest SDK module versions
+
+# v0.5.8 (2026-11-16)
+
+* **Dependency Update**: Updated to the latest SDK module versions
+
+# v0.5.7 (2026-11-10)
+
+* **Dependency Update**: Update to smithy-go v1.28.9.
+* **Dependency Update**: Updated to the latest SDK module versions
+
+# v0.5.6 (2026-11-09)
+
+* **Dependency Update**: Updated to the latest SDK module versions
+
+# v0.5.5 (2026-11-06)
+
+* **Dependency Update**: Updated to the latest SDK module versions
+
+# v0.5.4 (2026-11-05)
+
+* **Dependency Update**: Updated to the latest SDK module versions
+
+# v0.5.3 (2026-11-04)
+
+* **Dependency Update**: Update to smithy-go v1.28.8.
+* **Dependency Update**: Updated to the latest SDK module versions
+
+# v0.5.2 (2026-10-30)
+
+* **Dependency Update**: Updated to the latest SDK module versions
+
+# v0.5.1 (2026-10-27)
+
+* **Dependency Update**: Update to smithy-go v1.28.7.
+* **Dependency Update**: Updated to the latest SDK module versions
+
+# v0.5.0 (2026-10-26)
+
+* **Feature**: Improve DownloadDirectory throughput and memory usage by downloading objects with DownloadObject, and only replace an existing file once its download succeeds.
+* **Dependency Update**: Updated to the latest SDK module versions
+
+# v0.4.19 (2026-10-22)
+
+* **Bug Fix**: Update smithy-go to v1.28.6
+* **Dependency Update**: Updated to the latest SDK module versions
+
+# v0.4.18 (2026-10-21)
+
+* **Dependency Update**: Updated to the latest SDK module versions
+
+# v0.4.17 (2026-10-19)
+
+* **Bug Fix**: Fix the concurrent reader panic when buffer len is smaller than capacity
+
+# v0.4.16 (2026-10-09.2)
+
+* **Dependency Update**: Update to smithy-go v1.28.5.
+* **Dependency Update**: Updated to the latest SDK module versions
+
 # v0.4.15 (2026-10-08)
 
 * **Dependency Update**: Update to smithy-go v1.28.4.

@@ -59,6 +59,10 @@ func (r *concurrentReader) Read(p []byte) (int, error) {
 		return 0, err
 	}
 
+	if len(p) == 0 {
+		return 0, r.getErr()
+	}
+
 	clientOptions := []func(*s3.Options){
 		func(o *s3.Options) {
 			o.APIOptions = append(o.APIOptions,
@@ -149,41 +153,63 @@ func (r *concurrentReader) downloadChunk(ctx context.Context, chunk getChunk, cl
 		params.IfMatch = r.etag
 	}
 
-	out, err := r.options.S3.GetObject(ctx, params, clientOptions...)
+	var out *s3.GetObjectOutput
+	var oc outChunk
+	var err error
+	for retry := 0; retry < max(r.options.PartBodyMaxRetries, 1); retry++ {
+		out, oc, err = r.tryDownloadChunk(ctx, params, clientOptions...)
+		if err == nil {
+			break
+		}
+		if _, ok := err.(*errReadingBody); !ok {
+			return nil, err
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
+
+	oc.index = chunk.index
+	r.ch <- oc
+
+	output := &GetObjectOutput{}
+	output.mapFromGetObjectOutput(out, params.ChecksumMode)
+	return output, nil
+}
+
+// tryDownloadChunk downloads the chunk from s3 once
+func (r *concurrentReader) tryDownloadChunk(ctx context.Context, params *s3.GetObjectInput, clientOptions ...func(*s3.Options)) (*s3.GetObjectOutput, outChunk, error) {
+	out, err := r.options.S3.GetObject(ctx, params, clientOptions...)
+	if err != nil {
+		return nil, outChunk{}, err
+	}
+	defer out.Body.Close()
 
 	respStart := int64(-1)
 	respEnd := int64(-1)
 	if out.ContentRange != nil {
 		respStart, respEnd, err = getRespRange(aws.ToString(out.ContentRange))
 		if err != nil {
-			return nil, err
+			return nil, outChunk{}, err
 		}
 		if params.Range != nil {
 			reqStart, reqEnd, err := getReqRange(aws.ToString(params.Range))
 			if err != nil {
-				return nil, err
+				return nil, outChunk{}, err
 			}
 			// don't validate first chunk since object size is unknown when getting that
 			if reqStart != 0 && (reqStart != respStart || reqEnd != respEnd) {
-				return nil, fmt.Errorf("range mismatch between request %d-%d and response %d-%d", reqStart, reqEnd, respStart, respEnd)
+				return nil, outChunk{}, fmt.Errorf("range mismatch between request %d-%d and response %d-%d", reqStart, reqEnd, respStart, respEnd)
 			}
 		}
 	}
 
-	defer out.Body.Close()
 	buf, err := io.ReadAll(out.Body)
 	if err != nil {
-		return nil, err
+		return nil, outChunk{}, &errReadingBody{err: err}
 	}
 
-	r.ch <- outChunk{body: bytes.NewReader(buf), index: chunk.index, length: aws.ToInt64(out.ContentLength), rangeStart: respStart, rangeEnd: respEnd}
-
-	output := &GetObjectOutput{}
-	output.mapFromGetObjectOutput(out, params.ChecksumMode)
-	return output, err
+	return out, outChunk{body: bytes.NewReader(buf), length: aws.ToInt64(out.ContentLength), rangeStart: respStart, rangeEnd: respEnd}, nil
 }
 
 // byteRange returns an HTTP Byte-Range header value that should be used by the
@@ -210,10 +236,6 @@ type outChunk struct {
 }
 
 func (r *concurrentReader) read(p []byte) (int, error) {
-	if cap(p) == 0 {
-		return 0, nil
-	}
-
 	if r.getType == types.GetObjectParts {
 		return r.partRead(p)
 	}
@@ -230,7 +252,7 @@ func (r *concurrentReader) partRead(p []byte) (int, error) {
 			return written, r.getErr()
 		}
 
-		if written >= cap(p) {
+		if written >= len(p) {
 			// don't return yet, parts already dispatched up to capacity may
 			// still be downloading or sitting in r.ch, and the received loop
 			// below is what drains them
@@ -292,7 +314,7 @@ func (r *concurrentReader) partRead(p []byte) (int, error) {
 		r.receiveCount++
 
 		// only directly feed into p if this is the next neighbor part
-		if oc.index == r.consecutiveIndex && written < cap(p) {
+		if oc.index == r.consecutiveIndex && written < len(p) {
 			if oc.rangeStart >= 0 {
 				if es, as := int64(written), oc.rangeStart-r.written; es != as {
 					r.setErr(fmt.Errorf("range mismatch between computed start position %d and actual start position %d for part %d in p", es, as, oc.index+1))
@@ -360,7 +382,7 @@ func (r *concurrentReader) rangeRead(p []byte) (int, error) {
 
 	partSize := r.partSize
 	minIndex := int32(r.written / partSize)
-	maxIndex := min(int32((r.written+int64(cap(p))-1)/partSize), atomic.LoadInt32(&r.capacity)-1)
+	maxIndex := min(int32((r.written+int64(len(p))-1)/partSize), atomic.LoadInt32(&r.capacity)-1)
 	for i := minIndex; i <= maxIndex; i++ {
 		if e := r.getErr(); e != nil && e != io.EOF {
 			r.clean()
@@ -407,7 +429,7 @@ func (r *concurrentReader) rangeRead(p []byte) (int, error) {
 
 		index := r.partSize*int64(oc.index) - r.written
 
-		if index < int64(cap(p)) {
+		if index < int64(len(p)) {
 			n, err := oc.body.Read(p[index:])
 			oc.cur += int64(n)
 			written += n

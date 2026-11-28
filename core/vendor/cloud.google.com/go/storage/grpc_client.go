@@ -29,9 +29,11 @@ import (
 
 	"cloud.google.com/go/auth"
 	"cloud.google.com/go/iam/apiv1/iampb"
+	"cloud.google.com/go/storage/experimental"
 	gapic "cloud.google.com/go/storage/internal/apiv2"
 	"cloud.google.com/go/storage/internal/apiv2/storagepb"
 	"github.com/googleapis/gax-go/v2"
+	"golang.org/x/oauth2/google"
 
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
@@ -40,6 +42,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/encoding"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -131,23 +134,25 @@ type grpcStorageClient struct {
 	metrics        *clientMetrics
 	metricsCleanup func()
 
+	// bufferPool allocates memory for parallel uploads. It is the pool set
+	// through experimental.WithBufferPool or, if none was set, the SDK's
+	// defaultBufferPool, which is closed when the client is closed.
+	bufferPool experimental.BufferPool
+
 	// configFeatureAttributes tracks client-level features that are enabled for this
 	// client instance.
 	configFeatureAttributes uint32
 }
 
-func enableClientMetrics(ctx context.Context, s *settings, config storageConfig) (*metricsContext, error) {
-	var project string
-	// TODO: use new auth client
-	c, err := transport.Creds(ctx, s.clientOption...)
-	if err == nil {
-		project = c.ProjectID
-	}
+func enableClientMetrics(ctx context.Context, project string, config storageConfig, disableExporter bool) (*metricsContext, error) {
 	metricsContext, err := newGRPCMetricContext(ctx, metricsConfig{
-		project:       project,
-		interval:      config.metricInterval,
-		manualReader:  config.manualReader,
-		meterProvider: config.meterProvider,
+		project:         project,
+		interval:        config.metricInterval,
+		customExporter:  config.metricExporter,
+		manualReader:    config.manualReader,
+		meterProvider:   config.meterProvider,
+		disableExporter: disableExporter,
+		monitoringOpts:  config.monitoringOpts,
 	},
 	)
 	if err != nil {
@@ -169,9 +174,32 @@ func newGRPCStorageClient(ctx context.Context, opts ...storageOption) (client *g
 		return nil, errors.New("storage: GRPC is incompatible with any option that specifies an API for reads")
 	}
 
-	if !config.disableClientMetrics {
+	if config.grpcKeepalive != nil {
+		// Pings are only sent while at least one RPC is in flight
+		// (PermitWithoutStream is intentionally left false): idle connections
+		// have no work to protect and pinging them would only consume the
+		// server's ping budget.
+		s.clientOption = append(s.clientOption,
+			option.WithGRPCDialOption(grpc.WithKeepaliveParams(keepalive.ClientParameters{
+				Time:    config.grpcKeepalive.Time,
+				Timeout: config.grpcKeepalive.Timeout,
+			})))
+	}
+
+	metricsEnabled := isOtelMetricsEnabled(&config) || isOtelDebugMetricsEnabled(&config)
+	tracingEnabled := isOTelTracingDevEnabled()
+	var authCreds *auth.Credentials
+	var googleCreds *google.Credentials
+	var project string
+	var exportOK bool
+	if !config.disableClientMetrics || tracingEnabled {
+		authCreds, googleCreds, project = resolveGRPCAuthCredentials(ctx, s)
+		config.monitoringOpts, exportOK = monitoringClientOptions(s.clientOption, authCreds, googleCreds)
+	}
+
+	if !config.disableClientMetrics && (exportOK || config.meterProvider != nil || config.manualReader != nil || config.metricExporter != nil) {
 		// Do not fail client creation if enabling metrics fails.
-		if metricsContext, err := enableClientMetrics(ctx, s, config); err == nil {
+		if metricsContext, err := enableClientMetrics(ctx, project, config, !exportOK); err == nil {
 			s.metricsContext = metricsContext
 			s.clientOption = append(s.clientOption, metricsContext.clientOpts...)
 		} else {
@@ -181,15 +209,32 @@ func newGRPCStorageClient(ctx context.Context, opts ...storageOption) (client *g
 
 	var clientMetrics *clientMetrics
 	var metricsCleanup func()
-	if isOtelMetricsEnabled(&config) {
-		clientMetrics, metricsCleanup = initGRPCMetricsAndWrapCredentials(ctx, &config, s)
-		if clientMetrics != nil {
-			unaryInt, streamInt := metricsInterceptors(clientMetrics)
-			s.clientOption = append(s.clientOption,
-				option.WithGRPCDialOption(grpc.WithChainUnaryInterceptor(unaryInt)),
-				option.WithGRPCDialOption(grpc.WithChainStreamInterceptor(streamInt)),
-			)
-			s.clientOption = append(s.clientOption, grpcNetworkMetricsDialOptions("storage.googleapis.com", clientMetrics)...)
+	if metricsEnabled || tracingEnabled {
+		if metricsEnabled {
+			if exportOK || config.meterProvider != nil || config.metricExporter != nil {
+				clientMetrics, metricsCleanup = initClientMetrics(ctx, project, &config)
+			}
+			if clientMetrics != nil {
+				authCreds = wrapAuthCredentials(authCreds, clientMetrics)
+				unaryInt, streamInt := metricsInterceptors(clientMetrics)
+				s.clientOption = append(s.clientOption,
+					option.WithGRPCDialOption(grpc.WithChainUnaryInterceptor(unaryInt)),
+					option.WithGRPCDialOption(grpc.WithChainStreamInterceptor(streamInt)),
+				)
+				endpoint := "storage.googleapis.com"
+				if res, err := internaloption.NewUnsafeResolver(s.clientOption...); err == nil {
+					if ep, err := res.ResolvedGRPCEndpoint(); err == nil && ep != "" {
+						endpoint = ep
+					}
+				}
+				s.clientOption = append(s.clientOption, grpcNetworkMetricsDialOptions(endpoint, clientMetrics)...)
+			}
+		}
+		if tracingEnabled {
+			authCreds = wrapAuthCredentialsForTracing(authCreds)
+		}
+		if authCreds != nil {
+			s.clientOption = append(s.clientOption, option.WithAuthCredentials(authCreds))
 		}
 	}
 
@@ -215,12 +260,17 @@ func newGRPCStorageClient(ctx context.Context, opts ...storageOption) (client *g
 		}
 	}
 
+	bufferPool := config.bufferPool
+	if bufferPool == nil {
+		bufferPool = newDefaultBufferPool()
+	}
 	c := &grpcStorageClient{
 		settings:       s,
 		config:         &config,
 		metrics:        clientMetrics,
 		metricsCleanup: metricsCleanup,
 		readStallMgr:   bd,
+		bufferPool:     bufferPool,
 	}
 	// Add routing interceptors to inject headers.
 	ui, si := c.routingInterceptors()
@@ -228,6 +278,15 @@ func newGRPCStorageClient(ctx context.Context, opts ...storageOption) (client *g
 		option.WithGRPCDialOption(grpc.WithChainUnaryInterceptor(ui)),
 		option.WithGRPCDialOption(grpc.WithChainStreamInterceptor(si)),
 	)
+	if isOTelTracingDevEnabled() {
+		// Registered after the transport's OpenTelemetry stats handler so
+		// that it sees the attempt span: both google.golang.org/api/transport/grpc
+		// (dial.go) and cloud.google.com/go/auth/grpctransport (grpctransport.go)
+		// add their otelgrpc handler before the caller's dial options.
+		// See attemptStatsHandler.
+		s.clientOption = append(s.clientOption,
+			option.WithGRPCDialOption(grpc.WithStatsHandler(attemptStatsHandler{})))
+	}
 	c.dpDiag = directPathDiagnostic(ctx, s.clientOption...)
 	g, err := gapic.NewClient(ctx, s.clientOption...)
 	if err != nil {
@@ -238,26 +297,27 @@ func newGRPCStorageClient(ctx context.Context, opts ...storageOption) (client *g
 	return c, nil
 }
 
-func initGRPCMetricsAndWrapCredentials(ctx context.Context, config *storageConfig, s *settings) (*clientMetrics, func()) {
-	var project string
-	var authCreds *auth.Credentials
-
-	credsOpts := append([]option.ClientOption{option.WithScopes(gapic.DefaultAuthScopes()...)}, s.clientOption...)
-	if c, err := internaloption.AuthCreds(ctx, credsOpts); err == nil {
-		authCreds = c
-		project, _ = authCreds.ProjectID(ctx)
-	} else if c, err := transport.Creds(ctx, credsOpts...); err == nil {
-		project = c.ProjectID
-	}
-
-	clientMetrics, metricsCleanup := initClientMetrics(ctx, project, config)
-	if clientMetrics != nil {
-		if authCreds != nil {
-			authCreds = wrapAuthCredentials(authCreds, clientMetrics)
-			s.clientOption = append(s.clientOption, option.WithAuthCredentials(authCreds))
+func resolveGRPCAuthCredentials(ctx context.Context, s *settings) (*auth.Credentials, *google.Credentials, string) {
+	if res, err := internaloption.NewUnsafeResolver(s.clientOption...); err == nil {
+		if res.ResolvedGRPCConnIsCustom() || res.ResolvedWithoutAuthentication() || res.ResolvedWithAPIKeyIsCustom() {
+			return nil, nil, ""
 		}
 	}
-	return clientMetrics, metricsCleanup
+	credsOpts := append([]option.ClientOption{
+		internaloption.WithDefaultUniverseDomain("googleapis.com"),
+		internaloption.WithDefaultAudience("https://storage.googleapis.com/"),
+		internaloption.WithDefaultScopes(gapic.DefaultAuthScopes()...),
+		internaloption.EnableJwtWithScope(),
+		internaloption.EnableNewAuthLibrary(),
+	}, s.clientOption...)
+	if c, err := internaloption.AuthCreds(ctx, credsOpts); err == nil && c != nil {
+		project, _ := c.ProjectID(ctx)
+		return c, nil, project
+	}
+	if c, err := transport.Creds(ctx, credsOpts...); err == nil && c != nil {
+		return nil, c, c.ProjectID
+	}
+	return nil, nil, ""
 }
 
 // configureStreamingTimeouts explicitly overrides default call timeouts to 0 (unbounded)
@@ -294,7 +354,9 @@ func (c *grpcStorageClient) routingInterceptors() (grpc.UnaryClientInterceptor, 
 
 func (c *grpcStorageClient) prepareDirectPathMetadata(ctx context.Context, target string) (context.Context, error) {
 	md, ok := metadata.FromOutgoingContext(ctx)
-	if !ok {
+	if ok {
+		md = md.Copy()
+	} else {
 		md = metadata.MD{}
 	}
 
@@ -326,14 +388,20 @@ func (c *grpcStorageClient) prepareDirectPathMetadata(ctx context.Context, targe
 		}
 	}
 
-	// Client level feature tracking.
+	// Client level feature tracking. This client owns the feature header:
+	// it is always rewritten from the merged bitmask so that only a single,
+	// well-formed value is sent, and it is removed entirely when there is
+	// nothing to report (e.g. a value set on the context by a caller for an
+	// unrelated client must not be forwarded on data-path requests).
 	features := featureAttributes(ctx)
 	features |= c.configFeatureAttributes
 	// Merge all existing headers for this key from metadata.
-	features |= mergeFeatureAttributes(md[featureTrackerHeaderName])
+	features |= mergeFeatureAttributes(md.Get(featureTrackerHeaderName))
 
 	if features > 0 {
-		md.Set(featureTrackerHeaderName, encodeUint32(features))
+		md.Set(featureTrackerHeaderName, encodeFeatureMask(features))
+	} else {
+		md.Delete(featureTrackerHeaderName)
 	}
 
 	return metadata.NewOutgoingContext(ctx, md), nil
@@ -345,6 +413,10 @@ func (c *grpcStorageClient) Close() error {
 	}
 	if c.metricsCleanup != nil {
 		c.metricsCleanup()
+	}
+	// Only close the SDK-owned defaultBufferPool; custom pools are managed by the caller.
+	if pool, ok := c.bufferPool.(*defaultBufferPool); ok {
+		pool.close()
 	}
 	return c.raw.Close()
 }
@@ -649,7 +721,8 @@ func (c *grpcStorageClient) ListObjects(ctx context.Context, bucket string, q *Q
 		ctx, record := startMetricsOp(it.ctx, "ListObjects", false)
 		defer func() { record(err) }()
 		// Add trace span around List API call within the fetch.
-		ctx, _ = startSpan(ctx, "grpcStorageClient.ObjectsListCall")
+		// Bucket.Objects has no operation span, so gcp.storage.uri is recorded on each per-page ObjectsListCall span.
+		ctx, _ = startSpan(ctx, "grpcStorageClient.ObjectsListCall", withStorageURI(bucket, ""), rpcSystemGRPCOpt)
 		defer func() { endSpan(ctx, err) }()
 		var objects []*storagepb.Object
 		var gitr *gapic.ObjectIterator
@@ -1129,6 +1202,7 @@ func (c *grpcStorageClient) ComposeObject(ctx context.Context, req *composeObjec
 	rawReq := &storagepb.ComposeObjectRequest{
 		Destination:   dstObjPb,
 		SourceObjects: srcs,
+		KmsKey:        req.dstObject.attrs.KMSKeyName,
 	}
 	if req.deleteSourceObjects {
 		rawReq.DeleteSourceObjects = proto.Bool(true)
@@ -1286,7 +1360,7 @@ func (c *grpcStorageClient) NewRangeReader(ctx context.Context, params *newRange
 		return c.NewRangeReaderReadObject(ctx, params, opts...)
 	}
 
-	ctx, _ = startSpan(ctx, "grpcStorageClient.NewRangeReader")
+	ctx, _ = startSpan(ctx, "grpcStorageClient.NewRangeReader", rpcSystemGRPCOpt)
 	defer func() { endSpan(ctx, err) }()
 
 	s := callSettings(c.settings, opts...)
@@ -1405,6 +1479,7 @@ func (c *grpcStorageClient) NewRangeReader(ctx context.Context, params *newRange
 				databufs: databufs,
 			}
 			err = decoder.readFullObjectResponse()
+			recordBidiReadPayload(stream, decoder, err)
 			return err
 		}
 
@@ -1412,7 +1487,7 @@ func (c *grpcStorageClient) NewRangeReader(ctx context.Context, params *newRange
 			decoder = nil
 			return executeWithReadStallTimeout(ctx, c.readStallMgr, params.bucket, openStream, func(stallTimeout time.Duration) {
 				target := stripPort(metricsStateFromContext(ctx).getTarget())
-				c.metrics.recordStallDuration(ctx, stallTimeout, "ReadObject", "grpc", target)
+				c.metrics.recordStallDuration(ctx, stallTimeout, rpcBidiReadObject, "grpc", target)
 				if decoder != nil && decoder.databufs != nil {
 					decoder.databufs.Free()
 					decoder = nil
@@ -1483,15 +1558,7 @@ func (c *grpcStorageClient) NewRangeReader(ctx context.Context, params *newRange
 		wantCRC = checksums.GetCrc32C()
 	}
 
-	// The remaining bytes are the lesser of the requested range and all bytes
-	// after params.offset.
-	length := params.length
-	if params.length > size || params.length < 0 {
-		// if params.length < 0 (or larger than object size),
-		// all remaining bytes were requested.
-		length = size
-	}
-	remain := length - startOffset
+	remain := rangeReaderRemain(size, startOffset, params.length)
 
 	var chunkCRC uint32
 	var chunkCRCPresent bool
@@ -1514,6 +1581,7 @@ func (c *grpcStorageClient) NewRangeReader(ctx context.Context, params *newRange
 			Metageneration:  obj.GetMetageneration(),
 			Generation:      obj.GetGeneration(),
 			CRC32C:          wantCRC,
+			Unfinalized:     !finalized,
 		},
 		objectMetadata: &metadata,
 		reader: &gRPCReader{
@@ -1533,12 +1601,11 @@ func (c *grpcStorageClient) NewRangeReader(ctx context.Context, params *newRange
 			finalized:       finalized,
 			negativeOffset:  negativeOffset,
 		},
-		checkCRC:    checkCRC,
-		handle:      &handle,
-		remain:      remain,
-		unfinalized: !finalized,
-		bucket:      params.bucket,
-		object:      params.object,
+		checkCRC: checkCRC,
+		handle:   &handle,
+		remain:   remain,
+		bucket:   params.bucket,
+		object:   params.object,
 	}
 
 	// For a zero-length request, explicitly close the stream and set remaining
@@ -1549,6 +1616,22 @@ func (c *grpcStorageClient) NewRangeReader(ctx context.Context, params *newRange
 	}
 
 	return r, nil
+}
+
+// rangeReaderRemain returns the number of bytes a range read is expected to
+// return: the lesser of the requested length and the bytes available in an
+// object of the given size after startOffset. A negative length means the
+// rest of the object was requested. startOffset must already be resolved to a
+// non-negative absolute offset.
+func rangeReaderRemain(size, startOffset, length int64) int64 {
+	remain := size - startOffset
+	if remain < 0 {
+		return 0
+	}
+	if length >= 0 && length < remain {
+		return length
+	}
+	return remain
 }
 
 // IAM methods.
@@ -1708,7 +1791,7 @@ func (r *gRPCReader) updateCRC(b []byte) {
 // Checks whether the CRC matches at the conclusion of a read, if CRC checking was enabled.
 func (r *gRPCReader) runCRCCheck() error {
 	if r.checkCRC && r.gotCRC != r.wantCRC {
-		return fmt.Errorf("storage: bad CRC on read: got %d, want %d", r.gotCRC, r.wantCRC)
+		return fmt.Errorf("%w: bad CRC on read: got %d, want %d", errChecksumMismatch, r.gotCRC, r.wantCRC)
 	}
 	return nil
 }
@@ -1716,7 +1799,7 @@ func (r *gRPCReader) runCRCCheck() error {
 // checkAndResetChunkCRC verifies the chunk CRC if present, and resets the chunk CRC state.
 func (r *gRPCReader) checkAndResetChunkCRC() error {
 	if r.chunkCRCPresent && r.gotChunkCRC != r.wantChunkCRC {
-		return fmt.Errorf("storage: bad CRC on chunk read: got %d, want %d", r.gotChunkCRC, r.wantChunkCRC)
+		return fmt.Errorf("%w: bad CRC on chunk read: got %d, want %d", errChecksumMismatch, r.gotChunkCRC, r.wantChunkCRC)
 	}
 	r.gotChunkCRC = 0
 	r.chunkCRCPresent = false
@@ -1877,13 +1960,17 @@ func (r *gRPCReader) WriteTo(w io.Writer) (int64, error) {
 	return r.seen - alreadySeen, finalErr
 }
 
-// Close cancels the read stream's context in order for it to be closed and
-// collected, and frees any currently in use buffers.
+// Close drains a completed stream (bounded by defaultStreamDrainTimeout) so
+// the RPC ends cleanly, then cancels the context and frees buffers.
 func (r *gRPCReader) Close() error {
+	if r.stream != nil && ((r.finalized || r.negativeOffset) && r.size == r.seen || r.zeroRange) {
+		drainStreamOnCompletion(r.cancel, r.stream)
+	}
 	if r.cancel != nil {
 		r.cancel()
 	}
 
+	r.stream = nil
 	r.currMsg = nil
 	return nil
 }
@@ -1905,7 +1992,7 @@ func (r *gRPCReader) recv() error {
 	err := r.stream.RecvMsg(&databufs)
 	// If we get a mid-stream error on a recv call, reopen the stream.
 	// ABORTED could indicate a redirect so should also trigger a reopen.
-	if err != nil && (r.settings.retry.runShouldRetry(err, nil) || status.Code(err) == codes.Aborted) {
+	if err != nil && ((r.settings != nil && r.settings.retry.runShouldRetry(err, nil)) || status.Code(err) == codes.Aborted) {
 		// This will "close" the existing stream and immediately attempt to
 		// reopen the stream, but will backoff if further attempts are necessary.
 		// Reopening the stream Recvs the first message, so if retrying is
@@ -1918,7 +2005,9 @@ func (r *gRPCReader) recv() error {
 	}
 
 	r.currMsg = &readResponseDecoder{databufs: databufs}
-	return r.currMsg.readFullObjectResponse()
+	err = r.currMsg.readFullObjectResponse()
+	recordBidiReadPayload(r.stream, r.currMsg, err)
+	return err
 }
 
 // ReadObjectResponse field and subfield numbers.
@@ -2117,7 +2206,7 @@ func (d *readResponseDecoder) verifyChecksums() {
 			if d.crcErrs == nil {
 				d.crcErrs = make(map[int64]error)
 			}
-			d.crcErrs[readID] = fmt.Errorf("storage: bad CRC on chunk read: got %d, want %d", gotCRC, wantCRC)
+			d.crcErrs[readID] = fmt.Errorf("%w: bad CRC on chunk read: got %d, want %d", errChecksumMismatch, gotCRC, wantCRC)
 		}
 	}
 }
